@@ -1,0 +1,47 @@
+spec_version: "1"
+name: antibiotic-stewardship
+description: >
+  Antibiotic stewardship RL environment. An LLM agent acts as a clinical
+  pharmacist treating patients while managing antimicrobial resistance.
+  WHO-priority domain: AMR kills ~700 000 people/year globally.
+
+tasks:
+  - id: easy
+    description: >
+      10 healthy adult patients with mild-to-moderate infections.
+      Low baseline resistance. Goal: match drug strength to severity.
+    max_steps: 10
+    scoring: normalised_reward   # 0.0 – 1.0
+
+  - id: medium
+    description: >
+      15 patients with mixed severities, some resistance already present,
+      including elderly and paediatric patients sensitive to side-effects.
+    max_steps: 15
+    scoring: normalised_reward
+
+  - id: hard
+    description: >
+      20-patient emergency ward: MRSA infections, severe cases, high
+      pre-existing resistance, and a large proportion of vulnerable patients.
+    max_steps: 20
+    scoring: normalised_reward
+
+endpoints:
+  reset: POST /reset
+  step:  POST /step
+  state: GET  /state
+  grade: GET  /grade
+
+action_space:
+  type: discrete
+  n: 3
+  labels: ["Penicillin", "Azithromycin", "Vancomycin"]
+
+observation_space:
+  infection:        {type: string, enum: [E.coli, Staph, Strep, MRSA]}
+  severity:         {type: integer, min: 1, max: 3}
+  age:              {type: integer, min: 1, max: 100}
+  resistance:       {type: object, description: "drug-index -> float 0-1"}
+  patients_treated: {type: integer}
+  patients_total:   {type: integer}

@@ -1,0 +1,1 @@
+https://www.scaler.com/school-of-technology/meta-pytorch-hackathon?utm_source=midfunnel&utm_medium=email&utm_campaign=~3bcdn1rhttps://www.scaler.com/school-of-technology/meta-pytorch-hackathon/dashboard. 
