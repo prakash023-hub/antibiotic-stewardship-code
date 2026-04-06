@@ -1,19 +1,33 @@
 import os, json, argparse, requests
 from openai import OpenAI
-from typing import Optional
-from uuid import uuid4
+from typing import Optional, List
 
 # ── config ────────────────────────────────────────────────────────────────────
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:7860")
-MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
+API_BASE_URL   = os.getenv("API_BASE_URL", "http://localhost:7860")
+MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
+HF_TOKEN       = os.getenv("HF_TOKEN", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
 RESISTANCE_WARN   = 0.50
+
+
+# ── logging helpers ───────────────────────────────────────────────────────────
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+def log_step(step: int, action: int, reward: float, done: bool, error=None) -> None:
+    error_val = error if error else "null"
+    done_val  = str(done).lower()
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 
 # ── environment API ───────────────────────────────────────────────────────────
@@ -119,12 +133,10 @@ def build_history_summary(history: list) -> str:
 
 SYSTEM_PROMPT = """You are a world-class clinical pharmacist specialising in antibiotic stewardship.
 Your goal: maximise patient outcomes while preserving antibiotic effectiveness across the WHOLE episode.
-
 ANTIBIOTICS:
   0 = Penicillin    — mild infections. Resistance grows +0.15 per use (fastest).
   1 = Azithromycin  — moderate infections. Resistance grows +0.10 per use.
   2 = Vancomycin    — severe/MRSA. Resistance grows only +0.05 per use (slowest).
-
 SCORING:
   +10  correct drug, patient cured (resistance < 0.40)
   +3   correct drug, partial cure  (resistance 0.40-0.70)
@@ -132,7 +144,6 @@ SCORING:
   -15  underpowered for severity 3
   -12  Vancomycin overkill on severity 1
   Side-effect penalty: age<=12 -> -1.5 x drug_id; age>=65 -> -2.5 x drug_id
-
 DECISION RULES:
   severity 1 (mild):
     - prefer Penicillin (0); switch to Azithromycin (1) if resistance[0] > 0.50
@@ -145,23 +156,18 @@ DECISION RULES:
     - always Vancomycin (2)
   Vulnerable patients (age<=12 or age>=65):
     - use weakest drug that still works — stronger drugs cause side-effect penalties
-
 KEY INSIGHT: Using stronger drugs unnecessarily burns resistance for ALL future patients.
 Think across the whole episode, not just the current patient.
-
 Respond ONLY with valid JSON: {"antibiotic": <0|1|2>, "reasoning": "<one sentence>"}"""
 
 
 def ask_llm(obs: dict, history: list, retries: int = 3) -> int:
     user_msg = f"""CURRENT PATIENT:
 {json.dumps(obs, indent=2)}
-
 LIVE RESISTANCE STATUS:
 {build_resistance_commentary(obs)}
-
 EPISODE HISTORY:
 {build_history_summary(history)}
-
 This is patient {obs['patients_treated'] + 1} of {obs['patients_total']}.
 Choose the antibiotic:"""
 
@@ -178,48 +184,32 @@ Choose the antibiotic:"""
             )
             result     = json.loads(response.choices[0].message.content)
             antibiotic = int(result["antibiotic"])
-            # reasoning  = result.get("reasoning", "")
 
             if antibiotic not in (0, 1, 2):
                 raise ValueError(f"Invalid choice: {antibiotic}")
 
-            # old human log:
-            # print(f"         LLM -> {ANTIBIOTIC_NAMES[antibiotic]}: {reasoning}")
             return antibiotic
 
         except Exception as e:
-            # print(f"         LLM attempt {attempt+1} failed: {e}")
             if attempt == retries - 1:
                 break
 
     # Hard fallback
     fallback = {1: 0, 2: 1, 3: 2}.get(obs.get("severity", 2), 1)
-    # print(f"         Fallback -> {ANTIBIOTIC_NAMES[fallback]}")
     return fallback
 
 
 # ── episode runner ────────────────────────────────────────────────────────────
 
 def run_task(task_id: str) -> float:
-    # run/task banners (safe, but evaluator ignores them)
-    # print(f"\n{'='*60}")
-    # print(f"  TASK: {task_id.upper()}")
-    # print(f"{'='*60}")
-
     reset_data  = env_reset(task_id)
     observation = reset_data["observation"]
     history     = []
+    rewards     = []
+    step_num    = 0
 
-    run_id = str(uuid4())
-    total_patients = observation.get("patients_total", 0)
-
-    # [START] log
-    start_payload = {
-        "run_id": run_id,
-        "task_id": task_id,
-        "total_patients": total_patients,
-    }
-    print(f"[START] {json.dumps(start_payload)}", flush=True)
+    # [START]
+    log_start(task=task_id, env="antibiotic-stewardship", model=MODEL_NAME)
 
     while True:
         sev       = observation["severity"]
@@ -227,23 +217,21 @@ def run_task(task_id: str) -> float:
         age       = observation["age"]
         patient_n = observation["patients_treated"] + 1
         total     = observation["patients_total"]
-
-        # old per-patient human print:
-        # print(f"\n  [Patient {patient_n}/{total}] age={age}, sev={sev}, {infection}")
+        step_num  = patient_n
 
         fast = deterministic_choice(observation)
         if fast is not None:
             antibiotic = fast
-            decision_source = "fast_path"
         else:
             antibiotic = ask_llm(observation, history)
-            decision_source = "llm"
 
         step_result = env_step(antibiotic)
         reward  = step_result["reward"]
         done    = step_result["done"]
         info    = step_result.get("info", {})
         outcome = info.get("outcome", "?")
+
+        rewards.append(reward)
 
         history.append({
             "patient_num": patient_n,
@@ -256,56 +244,21 @@ def run_task(task_id: str) -> float:
             "reward"     : reward,
         })
 
-        # [STEP] log
-        step_payload = {
-            "run_id": run_id,
-            "task_id": task_id,
-            "patient_index": patient_n,
-            "state": {
-                "severity": sev,
-                "infection": infection,
-                "age": age,
-                "patients_treated": observation["patients_treated"],
-                "patients_total": total,
-                "resistance": observation["resistance"],
-            },
-            "action": {
-                "antibiotic_id": antibiotic,
-                "antibiotic_name": ANTIBIOTIC_NAMES[antibiotic],
-                "source": decision_source,
-            },
-            "reward": reward,
-            "done": done,
-            "info": {
-                "outcome": outcome,
-            },
-        }
-        print(f"[STEP] {json.dumps(step_payload)}", flush=True)
+        # [STEP]
+        log_step(step=step_num, action=antibiotic, reward=reward, done=done, error=None)
 
         if done:
             break
 
         observation = step_result["observation"]
 
-    grade = env_grade()
-    score = grade["score"]
-    bd    = grade.get("breakdown", {})
+    grade   = env_grade()
+    score   = grade["score"]
+    success = score >= 0.1
 
-    # [END] log
-    end_payload = {
-        "run_id": run_id,
-        "task_id": task_id,
-        "score": score,
-        "breakdown": bd,
-    }
-    print(f"[END] {json.dumps(end_payload)}", flush=True)
+    # [END]
+    log_end(success=success, steps=step_num, score=score, rewards=rewards)
 
-    # old score print:
-    # print(f"\n  SCORE: {score:.4f} | "
-    #       f"cured={bd.get('cured',0)} "
-    #       f"failed={bd.get('failed',0)} "
-    #       f"overkill={bd.get('overkill',0)} "
-    #       f"partial={bd.get('partial',0)}")
     return score
 
 
@@ -328,17 +281,6 @@ def main():
         scores[task_id] = run_task(task_id)
 
     avg = sum(scores.values()) / len(scores)
-
-    # final banner (optional, safe):
-    # print(f"\n{'='*60}")
-    # print(f"  FINAL SCORES")
-    # print(f"{'='*60}")
-    # for k, v in scores.items():
-        # bar = "=" * int(v * 30)
-        # print(f"  {k:8s}: {v:.4f}  [{bar}]")
-    # print(f"  {'average':8s}: {avg:.4f}")
-    # print(f"{'='*60}\n")
-
     return avg
 
 
