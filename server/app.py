@@ -78,6 +78,10 @@ def list_tasks():
 class ResetRequest(BaseModel):
     task_id: str = "easy"
 
+class StepRequest(BaseModel):
+    antibiotic: int
+    task_id: Optional[str] = None   # optional: if provided, routes to correct env directly
+
 
 @app.post("/reset")
 async def reset(
@@ -102,9 +106,10 @@ async def reset(
 
 
 @app.post("/step")
-def step(action: Action):
-    env = _get_env()   # uses _active_task
-    obs_dict, reward, done, info = env.step(action.antibiotic)
+def step(req: StepRequest):
+    # prefer explicit task_id; fall back to _active_task for backward compat
+    env = _get_env(req.task_id)
+    obs_dict, reward, done, info = env.step(req.antibiotic)
     obs = Observation(**obs_dict) if obs_dict is not None else None
     return StepResult(observation=obs, reward=reward, done=done, info=info)
 
@@ -115,8 +120,9 @@ def state():
 
 
 @app.get("/grade")
-def grade():
-    env = _get_env()
+def grade(task_id: Optional[str] = None):
+    # prefer explicit task_id query param; fall back to _active_task
+    env = _get_env(task_id)
     return GradeResult(**env.grade())
 
 
