@@ -5,7 +5,7 @@ from typing import Optional, List
 # ── config ────────────────────────────────────────────────────────────────────
 API_BASE_URL   = os.getenv("API_BASE_URL", "http://localhost:7860")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or os.getenv("HF_TOKEN", "")
 HF_TOKEN       = os.getenv("HF_TOKEN", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
