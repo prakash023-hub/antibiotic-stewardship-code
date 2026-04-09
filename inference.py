@@ -5,10 +5,10 @@ from typing import Optional, List
 # ── config ────────────────────────────────────────────────────────────────────
 API_BASE_URL   = os.getenv("API_BASE_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or os.getenv("HF_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 HF_TOKEN       = os.getenv("HF_TOKEN", "")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY or HF_TOKEN)
 
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
@@ -30,30 +30,52 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 
+# ── safe HTTP helpers ─────────────────────────────────────────────────────────
+
+def safe_post(url: str, payload: dict = None, timeout: int = 30):
+    try:
+        r = requests.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+def safe_get(url: str, timeout: int = 30):
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+
 # ── environment API ───────────────────────────────────────────────────────────
 
 def env_reset(task_id: str) -> dict:
-    r = requests.post(f"{API_BASE_URL}/reset", json={"task_id": task_id}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    data, err = safe_post(f"{API_BASE_URL}/reset", {"task_id": task_id})
+    if err is not None:
+        print(f"[ERROR] env_reset failed: {err}", flush=True)
+        return {"error": err}
+    return data
 
 def env_step(antibiotic: int) -> dict:
-    r = requests.post(f"{API_BASE_URL}/step", json={"antibiotic": antibiotic}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    data, err = safe_post(f"{API_BASE_URL}/step", {"antibiotic": antibiotic})
+    if err is not None:
+        print(f"[ERROR] env_step failed: {err}", flush=True)
+        return {"error": err, "reward": -100.0, "done": True}
+    return data
 
 def env_grade() -> dict:
-    r = requests.get(f"{API_BASE_URL}/grade", timeout=30)
-    r.raise_for_status()
-    return r.json()
+    data, err = safe_get(f"{API_BASE_URL}/grade")
+    if err is not None:
+        print(f"[ERROR] env_grade failed: {err}", flush=True)
+        return {"error": err, "score": 0.0}
+    return data
+
 
 # ── deterministic fast-path ───────────────────────────────────────────────────
 
 def deterministic_choice(obs: dict) -> Optional[int]:
-    """
-    Returns an antibiotic (0/1/2) for crystal-clear cases,
-    or None to let the LLM decide.
-    """
     severity   = obs["severity"]
     infection  = obs["infection"]
     age        = obs["age"]
@@ -62,28 +84,20 @@ def deterministic_choice(obs: dict) -> Optional[int]:
     def usable(drug_id: int) -> bool:
         return resistance[drug_id] <= RESISTANCE_DANGER
 
-    # MRSA always needs Vancomycin
     if infection == "MRSA":
         return 2
-
-    # Severe → always Vancomycin (cascade down only if completely failed)
     if severity == 3:
         if usable(2): return 2
         if usable(1): return 1
         return 0
-
-    # Vulnerable + mild + Penicillin still works → never escalate
     is_vulnerable = age <= 12 or age >= 65
     if is_vulnerable and severity == 1 and usable(0):
         return 0
-
-    # All options failed for this severity → must escalate
     if severity == 1 and not usable(0) and not usable(1):
         return 2
     if severity == 2 and not usable(1) and not usable(0):
         return 2
-
-    return None   # LLM handles the nuanced middle-ground
+    return None
 
 
 # ── resistance commentary ─────────────────────────────────────────────────────
@@ -107,7 +121,6 @@ def build_resistance_commentary(obs: dict) -> str:
 def build_history_summary(history: list) -> str:
     if not history:
         return "No patients treated yet."
-
     lines = ["Recent patients (last 6):"]
     for h in history[-6:]:
         emoji = {"CURED": "[OK]", "Partial": "[~~]", "FAILED": "[XX]", "OVERKILL": "[!!]"}.get(h["outcome"], "[?]")
@@ -116,7 +129,6 @@ def build_history_summary(history: list) -> str:
             f"age={h['age']}, sev={h['severity']}, {h['infection']}, "
             f"gave {h['drug_name']} -> {h['outcome']} ({h['reward']:+.1f})"
         )
-
     outcomes = [h["outcome"] for h in history]
     lines.append(
         f"\nTotals so far: "
@@ -183,55 +195,58 @@ Choose the antibiotic:"""
             )
             result     = json.loads(response.choices[0].message.content)
             antibiotic = int(result["antibiotic"])
-
             if antibiotic not in (0, 1, 2):
                 raise ValueError(f"Invalid choice: {antibiotic}")
-
             return antibiotic
-
         except Exception as e:
+            print(f"[WARN] LLM attempt {attempt+1} failed: {e}", flush=True)
             if attempt == retries - 1:
                 break
 
-    # Hard fallback
+    # Hard fallback — never crash
     fallback = {1: 0, 2: 1, 3: 2}.get(obs.get("severity", 2), 1)
+    print(f"[WARN] Using deterministic fallback: {fallback}", flush=True)
     return fallback
 
 
 # ── episode runner ────────────────────────────────────────────────────────────
 
 def run_task(task_id: str) -> float:
-    reset_data  = env_reset(task_id)
+    log_start(task=task_id, env="antibiotic-stewardship", model=MODEL_NAME)
+
+    reset_data = env_reset(task_id)
+    if "error" in reset_data:
+        log_end(success=False, steps=0, score=0.0, rewards=[])
+        return 0.0
+
     observation = reset_data["observation"]
     history     = []
     rewards     = []
     step_num    = 0
-
-    # [START]
-    log_start(task=task_id, env="antibiotic-stewardship", model=MODEL_NAME)
 
     while True:
         sev       = observation["severity"]
         infection = observation["infection"]
         age       = observation["age"]
         patient_n = observation["patients_treated"] + 1
-        total     = observation["patients_total"]
         step_num  = patient_n
 
         fast = deterministic_choice(observation)
-        if fast is not None:
-            antibiotic = fast
-        else:
-            antibiotic = ask_llm(observation, history)
+        antibiotic = fast if fast is not None else ask_llm(observation, history)
 
         step_result = env_step(antibiotic)
+
+        if "error" in step_result:
+            log_step(step=step_num, action=antibiotic, reward=-100.0, done=True, error=step_result["error"])
+            rewards.append(-100.0)
+            break
+
         reward  = step_result["reward"]
         done    = step_result["done"]
         info    = step_result.get("info", {})
         outcome = info.get("outcome", "?")
 
         rewards.append(reward)
-
         history.append({
             "patient_num": patient_n,
             "severity"   : sev,
@@ -243,7 +258,6 @@ def run_task(task_id: str) -> float:
             "reward"     : reward,
         })
 
-        # [STEP]
         log_step(step=step_num, action=antibiotic, reward=reward, done=done, error=None)
 
         if done:
@@ -252,12 +266,10 @@ def run_task(task_id: str) -> float:
         observation = step_result["observation"]
 
     grade   = env_grade()
-    score   = grade["score"]
+    score   = grade.get("score", 0.0)
     success = score >= 0.1
 
-    # [END]
     log_end(success=success, steps=step_num, score=score, rewards=rewards)
-
     return score
 
 
