@@ -14,12 +14,12 @@ RESISTANCE_DANGER = 0.70
 RESISTANCE_WARN   = 0.50
 
 # 503 = backend session not ready (now returned instead of 400)
-RETRYABLE_STATUS = {502, 503, 504}
+RETRYABLE_STATUS = {500, 502, 503, 504}  # 500=unhandled server exception
 
 
 # ── retry helper ──────────────────────────────────────────────────────────────
 
-def _call_with_retry(fn, label: str, retries: int = 8, backoff: float = 5.0):
+def _call_with_retry(fn, label: str, retries: int = 10, backoff: float = 10.0):
     last_exc = None
     for attempt in range(retries):
         try:
