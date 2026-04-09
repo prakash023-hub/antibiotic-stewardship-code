@@ -70,16 +70,20 @@ def env_reset(task_id: str) -> dict:
         return r.json()
     return _call_with_retry(_do, label=f"env_reset({task_id})")
 
-def env_step(antibiotic: int) -> dict:
+def env_step(antibiotic: int, task_id: str = "") -> dict:
     def _do():
-        r = requests.post(f"{API_BASE_URL}/step", json={"antibiotic": antibiotic}, timeout=60)
+        payload = {"antibiotic": antibiotic}
+        if task_id:
+            payload["task_id"] = task_id          # lets backend route by task_id, not _active_task
+        r = requests.post(f"{API_BASE_URL}/step", json=payload, timeout=60)
         r.raise_for_status()
         return r.json()
     return _call_with_retry(_do, label=f"env_step(action={antibiotic})")
 
-def env_grade() -> dict:
+def env_grade(task_id: str = "") -> dict:
     def _do():
-        r = requests.get(f"{API_BASE_URL}/grade", timeout=60)
+        params = {"task_id": task_id} if task_id else {}
+        r = requests.get(f"{API_BASE_URL}/grade", params=params, timeout=60)
         r.raise_for_status()
         return r.json()
     return _call_with_retry(_do, label="env_grade()")
@@ -210,8 +214,18 @@ Choose the antibiotic:"""
 # ── episode runner ────────────────────────────────────────────────────────────
 
 def run_task(task_id: str) -> float:
-    reset_data  = env_reset(task_id)
-    observation = reset_data["observation"]
+    # ── inner reset guard: if /reset fails after all retries, return 0.0 cleanly
+    try:
+        reset_data = env_reset(task_id)
+    except Exception as e:
+        print(f"[run_task] env_reset({task_id}) failed permanently: {e} → scoring 0.0", flush=True)
+        return 0.0
+
+    observation = reset_data.get("observation")
+    if observation is None:
+        print(f"[run_task] /reset returned no observation for {task_id} → scoring 0.0", flush=True)
+        return 0.0
+
     history, rewards = [], []
     step_num = 0
 
@@ -225,7 +239,7 @@ def run_task(task_id: str) -> float:
         fast = deterministic_choice(observation)
         antibiotic = fast if fast is not None else ask_llm(observation, history)
 
-        step_result = env_step(antibiotic)
+        step_result = env_step(antibiotic, task_id=task_id)
         reward  = step_result["reward"]
         done    = step_result["done"]
         info    = step_result.get("info", {})
@@ -249,7 +263,7 @@ def run_task(task_id: str) -> float:
             print(f"[WARN] No observation at step {step_num}, ending early.", flush=True)
             break
 
-    grade   = env_grade()
+    grade   = env_grade(task_id=task_id)
     score   = grade.get("score", 0.0)
     log_end(success=score >= 0.1, steps=step_num, score=score, rewards=rewards)
     return score
