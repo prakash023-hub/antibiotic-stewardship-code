@@ -1,18 +1,51 @@
-import os, json, argparse, requests
+import os, json, argparse, requests, time
 from openai import OpenAI
 from typing import Optional, List
 
 # ── config ────────────────────────────────────────────────────────────────────
 API_BASE_URL   = os.getenv("API_BASE_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-HF_TOKEN       = os.getenv("HF_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or os.getenv("HF_TOKEN", "")
 
-client = OpenAI(api_key=OPENAI_API_KEY or HF_TOKEN)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
 RESISTANCE_WARN   = 0.50
+
+# 503 = backend session not ready (now returned instead of 400)
+RETRYABLE_STATUS = {502, 503, 504}
+
+
+# ── retry helper ──────────────────────────────────────────────────────────────
+
+def _call_with_retry(fn, label: str, retries: int = 8, backoff: float = 5.0):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except requests.exceptions.ConnectionError as e:
+            last_exc = e
+            wait = backoff * (attempt + 1)
+            print(f"[RETRY] {label}: connection error (attempt {attempt+1}/{retries}), waiting {wait:.0f}s", flush=True)
+            time.sleep(wait)
+        except requests.exceptions.Timeout as e:
+            last_exc = e
+            wait = backoff * (attempt + 1)
+            print(f"[RETRY] {label}: timeout (attempt {attempt+1}/{retries}), waiting {wait:.0f}s", flush=True)
+            time.sleep(wait)
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            status = e.response.status_code if e.response is not None else 0
+            if status in RETRYABLE_STATUS and attempt < retries - 1:
+                wait = backoff * (attempt + 1)
+                print(f"[RETRY] {label}: HTTP {status} (attempt {attempt+1}/{retries}), waiting {wait:.0f}s", flush=True)
+                time.sleep(wait)
+            else:
+                print(f"[ERROR] {label}: HTTP {status} — {e}", flush=True)
+                raise
+    print(f"[ERROR] {label}: all {retries} attempts failed — {last_exc}", flush=True)
+    raise last_exc
 
 
 # ── logging helpers ───────────────────────────────────────────────────────────
@@ -21,56 +54,35 @@ def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 def log_step(step: int, action: int, reward: float, done: bool, error=None) -> None:
-    error_val = error if error else "null"
-    done_val  = str(done).lower()
-    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error or 'null'}", flush=True)
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 
-# ── safe HTTP helpers ─────────────────────────────────────────────────────────
-
-def safe_post(url: str, payload: dict = None, timeout: int = 30):
-    try:
-        r = requests.post(url, json=payload, timeout=timeout)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-def safe_get(url: str, timeout: int = 30):
-    try:
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-
 # ── environment API ───────────────────────────────────────────────────────────
 
 def env_reset(task_id: str) -> dict:
-    data, err = safe_post(f"{API_BASE_URL}/reset", {"task_id": task_id})
-    if err is not None:
-        print(f"[ERROR] env_reset failed: {err}", flush=True)
-        return {"error": err}
-    return data
+    def _do():
+        r = requests.post(f"{API_BASE_URL}/reset", json={"task_id": task_id}, timeout=60)
+        r.raise_for_status()
+        return r.json()
+    return _call_with_retry(_do, label=f"env_reset({task_id})")
 
 def env_step(antibiotic: int) -> dict:
-    data, err = safe_post(f"{API_BASE_URL}/step", {"antibiotic": antibiotic})
-    if err is not None:
-        print(f"[ERROR] env_step failed: {err}", flush=True)
-        return {"error": err, "reward": -100.0, "done": True}
-    return data
+    def _do():
+        r = requests.post(f"{API_BASE_URL}/step", json={"antibiotic": antibiotic}, timeout=60)
+        r.raise_for_status()
+        return r.json()
+    return _call_with_retry(_do, label=f"env_step(action={antibiotic})")
 
 def env_grade() -> dict:
-    data, err = safe_get(f"{API_BASE_URL}/grade")
-    if err is not None:
-        print(f"[ERROR] env_grade failed: {err}", flush=True)
-        return {"error": err, "score": 0.0}
-    return data
+    def _do():
+        r = requests.get(f"{API_BASE_URL}/grade", timeout=60)
+        r.raise_for_status()
+        return r.json()
+    return _call_with_retry(_do, label="env_grade()")
 
 
 # ── deterministic fast-path ───────────────────────────────────────────────────
@@ -125,17 +137,13 @@ def build_history_summary(history: list) -> str:
     for h in history[-6:]:
         emoji = {"CURED": "[OK]", "Partial": "[~~]", "FAILED": "[XX]", "OVERKILL": "[!!]"}.get(h["outcome"], "[?]")
         lines.append(
-            f"  {emoji} Patient {h['patient_num']}: "
-            f"age={h['age']}, sev={h['severity']}, {h['infection']}, "
-            f"gave {h['drug_name']} -> {h['outcome']} ({h['reward']:+.1f})"
+            f"  {emoji} Patient {h['patient_num']}: age={h['age']}, sev={h['severity']}, "
+            f"{h['infection']}, gave {h['drug_name']} -> {h['outcome']} ({h['reward']:+.1f})"
         )
     outcomes = [h["outcome"] for h in history]
     lines.append(
-        f"\nTotals so far: "
-        f"{outcomes.count('CURED')} cured, "
-        f"{outcomes.count('FAILED')} failed, "
-        f"{outcomes.count('Partial')} partial, "
-        f"{outcomes.count('OVERKILL')} overkill"
+        f"\nTotals: {outcomes.count('CURED')} cured, {outcomes.count('FAILED')} failed, "
+        f"{outcomes.count('Partial')} partial, {outcomes.count('OVERKILL')} overkill"
     )
     return "\n".join(lines)
 
@@ -156,19 +164,12 @@ SCORING:
   -12  Vancomycin overkill on severity 1
   Side-effect penalty: age<=12 -> -1.5 x drug_id; age>=65 -> -2.5 x drug_id
 DECISION RULES:
-  severity 1 (mild):
-    - prefer Penicillin (0); switch to Azithromycin (1) if resistance[0] > 0.50
-    - NEVER use Vancomycin (2) on mild — it loses 12 points
-  severity 2 (moderate):
-    - prefer Azithromycin (1); escalate to Vancomycin (2) only if resistance[1] > 0.60
-  severity 3 (severe):
-    - always Vancomycin (2) unless resistance[2] > 0.70
-  MRSA:
-    - always Vancomycin (2)
-  Vulnerable patients (age<=12 or age>=65):
-    - use weakest drug that still works — stronger drugs cause side-effect penalties
-KEY INSIGHT: Using stronger drugs unnecessarily burns resistance for ALL future patients.
-Think across the whole episode, not just the current patient.
+  severity 1 (mild): prefer Penicillin(0); switch to Azithromycin(1) if resistance[0]>0.50; NEVER use Vancomycin(2)
+  severity 2 (moderate): prefer Azithromycin(1); escalate to Vancomycin(2) only if resistance[1]>0.60
+  severity 3 (severe): always Vancomycin(2) unless resistance[2]>0.70
+  MRSA: always Vancomycin(2)
+  Vulnerable (age<=12 or age>=65): use weakest drug that still works
+KEY INSIGHT: Stronger drugs unnecessarily burn resistance for ALL future patients.
 Respond ONLY with valid JSON: {"antibiotic": <0|1|2>, "reasoning": "<one sentence>"}"""
 
 
@@ -196,38 +197,28 @@ Choose the antibiotic:"""
             result     = json.loads(response.choices[0].message.content)
             antibiotic = int(result["antibiotic"])
             if antibiotic not in (0, 1, 2):
-                raise ValueError(f"Invalid choice: {antibiotic}")
+                raise ValueError(f"Invalid: {antibiotic}")
             return antibiotic
         except Exception as e:
-            print(f"[WARN] LLM attempt {attempt+1} failed: {e}", flush=True)
-            if attempt == retries - 1:
-                break
+            print(f"[LLM] attempt {attempt+1}/{retries} failed: {e}", flush=True)
 
-    # Hard fallback — never crash
     fallback = {1: 0, 2: 1, 3: 2}.get(obs.get("severity", 2), 1)
-    print(f"[WARN] Using deterministic fallback: {fallback}", flush=True)
+    print(f"[LLM] using fallback action={fallback}", flush=True)
     return fallback
 
 
 # ── episode runner ────────────────────────────────────────────────────────────
 
 def run_task(task_id: str) -> float:
+    reset_data  = env_reset(task_id)
+    observation = reset_data["observation"]
+    history, rewards = [], []
+    step_num = 0
+
     log_start(task=task_id, env="antibiotic-stewardship", model=MODEL_NAME)
 
-    reset_data = env_reset(task_id)
-    if "error" in reset_data:
-        log_end(success=False, steps=0, score=0.0, rewards=[])
-        return 0.0
-
-    observation = reset_data["observation"]
-    history     = []
-    rewards     = []
-    step_num    = 0
-
     while True:
-        sev       = observation["severity"]
-        infection = observation["infection"]
-        age       = observation["age"]
+        sev, infection, age = observation["severity"], observation["infection"], observation["age"]
         patient_n = observation["patients_treated"] + 1
         step_num  = patient_n
 
@@ -235,12 +226,6 @@ def run_task(task_id: str) -> float:
         antibiotic = fast if fast is not None else ask_llm(observation, history)
 
         step_result = env_step(antibiotic)
-
-        if "error" in step_result:
-            log_step(step=step_num, action=antibiotic, reward=-100.0, done=True, error=step_result["error"])
-            rewards.append(-100.0)
-            break
-
         reward  = step_result["reward"]
         done    = step_result["done"]
         info    = step_result.get("info", {})
@@ -248,28 +233,25 @@ def run_task(task_id: str) -> float:
 
         rewards.append(reward)
         history.append({
-            "patient_num": patient_n,
-            "severity"   : sev,
-            "age"        : age,
-            "infection"  : infection,
-            "drug_id"    : antibiotic,
-            "drug_name"  : ANTIBIOTIC_NAMES[antibiotic],
-            "outcome"    : outcome,
-            "reward"     : reward,
+            "patient_num": patient_n, "severity": sev, "age": age,
+            "infection": infection, "drug_id": antibiotic,
+            "drug_name": ANTIBIOTIC_NAMES[antibiotic],
+            "outcome": outcome, "reward": reward,
         })
 
-        log_step(step=step_num, action=antibiotic, reward=reward, done=done, error=None)
+        log_step(step=step_num, action=antibiotic, reward=reward, done=done)
 
         if done:
             break
 
-        observation = step_result["observation"]
+        observation = step_result.get("observation")
+        if observation is None:
+            print(f"[WARN] No observation at step {step_num}, ending early.", flush=True)
+            break
 
     grade   = env_grade()
     score   = grade.get("score", 0.0)
-    success = score >= 0.1
-
-    log_end(success=success, steps=step_num, score=score, rewards=rewards)
+    log_end(success=score >= 0.1, steps=step_num, score=score, rewards=rewards)
     return score
 
 
@@ -286,12 +268,18 @@ def main():
         API_BASE_URL = args.url.rstrip("/")
 
     task_list = [t.strip() for t in args.tasks.split(",")]
-    scores    = {}
+    scores = {}
 
     for task_id in task_list:
-        scores[task_id] = run_task(task_id)
+        try:
+            scores[task_id] = run_task(task_id)
+            print(f"[MAIN] task={task_id} score={scores[task_id]:.3f}", flush=True)
+        except Exception as e:
+            print(f"[MAIN] task={task_id} FAILED: {e}", flush=True)
+            scores[task_id] = 0.0
 
-    avg = sum(scores.values()) / len(scores)
+    avg = sum(scores.values()) / len(scores) if scores else 0.0
+    print(f"[MAIN] Final average score: {avg:.3f}", flush=True)
     return avg
 
 
