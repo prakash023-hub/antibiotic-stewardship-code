@@ -100,18 +100,33 @@ def deterministic_choice(obs: dict) -> Optional[int]:
     def usable(drug_id: int) -> bool:
         return resistance[drug_id] <= RESISTANCE_DANGER
 
-    if infection == "MRSA":
+    # MRSA: Vancomycin only if severe enough — NEVER overkill on sev=1
+    if infection == "MRSA" and severity >= 2:
         return 2
+    if infection == "MRSA" and severity == 1:
+        # treat like a mild infection — use weakest usable drug
+        if usable(0): return 0
+        if usable(1): return 1
+        return 2  # last resort
+
     if severity == 3:
         if usable(2): return 2
         if usable(1): return 1
         return 0
+
     is_vulnerable = age <= 12 or age >= 65
-    if is_vulnerable and severity == 1 and usable(0):
-        return 0
-    if severity == 1 and not usable(0) and not usable(1):
-        return 2
-    if severity == 2 and not usable(1) and not usable(0):
+
+    # severity 1: always prefer Penicillin, switch to Azithromycin if needed
+    if severity == 1:
+        if usable(0): return 0
+        if usable(1): return 1
+        return 2  # only if both failed
+
+    # severity 2: prefer Azithromycin, escalate only if needed
+    if severity == 2:
+        if is_vulnerable and usable(0): return 0   # minimize side-effects
+        if usable(1): return 1
+        if usable(0): return 0
         return 2
     return None
 
