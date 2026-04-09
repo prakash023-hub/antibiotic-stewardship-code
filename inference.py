@@ -3,11 +3,15 @@ from openai import OpenAI
 from typing import Optional, List
 
 # ── config ────────────────────────────────────────────────────────────────────
-API_BASE_URL   = os.getenv("API_BASE_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
-MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or os.getenv("HF_TOKEN", "")
+# LLM config — evaluator provides these
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
+HF_TOKEN     = os.getenv("HF_TOKEN", "")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Environment URL — YOUR HuggingFace Space (separate from LLM endpoint!)
+ENV_URL = os.getenv("ENV_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
+
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
@@ -65,7 +69,7 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 def env_reset(task_id: str) -> dict:
     def _do():
-        r = requests.post(f"{API_BASE_URL}/reset", json={"task_id": task_id}, timeout=60)
+        r = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id}, timeout=60)
         r.raise_for_status()
         return r.json()
     return _call_with_retry(_do, label=f"env_reset({task_id})")
@@ -75,7 +79,7 @@ def env_step(antibiotic: int, task_id: str = "") -> dict:
         payload = {"antibiotic": antibiotic}
         if task_id:
             payload["task_id"] = task_id          # lets backend route by task_id, not _active_task
-        r = requests.post(f"{API_BASE_URL}/step", json=payload, timeout=60)
+        r = requests.post(f"{ENV_URL}/step", json=payload, timeout=60)
         r.raise_for_status()
         return r.json()
     return _call_with_retry(_do, label=f"env_step(action={antibiotic})")
@@ -83,7 +87,7 @@ def env_step(antibiotic: int, task_id: str = "") -> dict:
 def env_grade(task_id: str = "") -> dict:
     def _do():
         params = {"task_id": task_id} if task_id else {}
-        r = requests.get(f"{API_BASE_URL}/grade", params=params, timeout=60)
+        r = requests.get(f"{ENV_URL}/grade", params=params, timeout=60)
         r.raise_for_status()
         return r.json()
     return _call_with_retry(_do, label="env_grade()")
@@ -293,8 +297,8 @@ def main():
     args = parser.parse_args()
 
     if args.url:
-        global API_BASE_URL
-        API_BASE_URL = args.url.rstrip("/")
+        global ENV_URL
+        ENV_URL = args.url.rstrip("/")
 
     task_list = [t.strip() for t in args.tasks.split(",")]
     scores = {}
