@@ -3,7 +3,7 @@ from openai import OpenAI
 from typing import Optional, List
 
 # ── config ────────────────────────────────────────────────────────────────────
-API_BASE_URL   = os.getenv("API_BASE_URL", "http://localhost:7860")
+API_BASE_URL   = os.getenv("API_BASE_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or os.getenv("HF_TOKEN", "")
 HF_TOKEN       = os.getenv("HF_TOKEN", "")
@@ -33,20 +33,19 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 # ── environment API ───────────────────────────────────────────────────────────
 
 def env_reset(task_id: str) -> dict:
-    r = requests.post(f"{API_BASE_URL}/reset", json={"task_id": task_id})
+    r = requests.post(f"{API_BASE_URL}/reset", json={"task_id": task_id}, timeout=30)
     r.raise_for_status()
     return r.json()
 
 def env_step(antibiotic: int) -> dict:
-    r = requests.post(f"{API_BASE_URL}/step", json={"antibiotic": antibiotic})
+    r = requests.post(f"{API_BASE_URL}/step", json={"antibiotic": antibiotic}, timeout=30)
     r.raise_for_status()
     return r.json()
 
 def env_grade() -> dict:
-    r = requests.get(f"{API_BASE_URL}/grade")
+    r = requests.get(f"{API_BASE_URL}/grade", timeout=30)
     r.raise_for_status()
     return r.json()
-
 
 # ── deterministic fast-path ───────────────────────────────────────────────────
 
