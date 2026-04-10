@@ -1,3 +1,7 @@
+import os, json, argparse, requests, time
+from openai import OpenAI
+from typing import Optional, List
+
 # LLM config — evaluator provides these
 API_BASE_URL = os.environ["API_BASE_URL"]   # no default
 MODEL_NAME   = os.environ["MODEL_NAME"]
@@ -10,7 +14,6 @@ client = OpenAI(
     base_url=API_BASE_URL,
     api_key=API_KEY,      # << not HF_TOKEN
 )
-
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
 RESISTANCE_WARN   = 0.50
