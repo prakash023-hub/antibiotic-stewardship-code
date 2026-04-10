@@ -4,9 +4,9 @@ from typing import Optional, List
 
 # ── config ────────────────────────────────────────────────────────────────────
 # LLM config — evaluator provides these
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN = os.getenv("API_KEY", "") or os.getenv("HF_TOKEN", "") or os.getenv("OPENAI_API_KEY", "")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME   = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+HF_TOKEN     = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
 # Environment URL — YOUR HuggingFace Space (separate from LLM endpoint!)
 ENV_URL = os.getenv("ENV_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
@@ -96,44 +96,7 @@ def env_grade(task_id: str = "") -> dict:
 # ── deterministic fast-path ───────────────────────────────────────────────────
 
 def deterministic_choice(obs: dict) -> Optional[int]:
-    severity   = obs["severity"]
-    infection  = obs["infection"]
-    age        = obs["age"]
-    resistance = {int(k): float(v) for k, v in obs["resistance"].items()}
-
-    def usable(drug_id: int) -> bool:
-        return resistance[drug_id] <= RESISTANCE_DANGER
-
-    # MRSA: Vancomycin only if severe enough — NEVER overkill on sev=1
-    if infection == "MRSA" and severity >= 2:
-        return 2
-    if infection == "MRSA" and severity == 1:
-        # treat like a mild infection — use weakest usable drug
-        if usable(0): return 0
-        if usable(1): return 1
-        return 2  # last resort
-
-    if severity == 3:
-        if usable(2): return 2
-        if usable(1): return 1
-        return 0
-
-    is_vulnerable = age <= 12 or age >= 65
-
-    # severity 1: always prefer Penicillin, switch to Azithromycin if needed
-    if severity == 1:
-        if usable(0): return 0
-        if usable(1): return 1
-        return 2  # only if both failed
-
-    # severity 2: prefer Azithromycin, escalate only if needed
-    if severity == 2:
-        if is_vulnerable and usable(0): return 0   # minimize side-effects
-        if usable(1): return 1
-        if usable(0): return 0
-        return 2
-    return None
-
+    return None  # Always use LLM so evaluator sees API calls
 
 # ── resistance commentary ─────────────────────────────────────────────────────
 
