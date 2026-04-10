@@ -3,28 +3,21 @@ from openai import OpenAI
 from typing import Optional, List
 
 # LLM config — evaluator provides these
-API_BASE_URL = os.environ["API_BASE_URL"]
-MODEL_NAME   = os.environ["MODEL_NAME"]
-API_KEY      = os.environ["API_KEY"]
-HF_TOKEN     = os.environ.get("HF_TOKEN", "")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
+HF_TOKEN     = os.getenv("HF_TOKEN", "")
 
+# Environment URL — YOUR HuggingFace Space
 ENV_URL = os.getenv("ENV_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
 
-client = OpenAI(
-    base_url=API_BASE_URL,
-    api_key=API_KEY,
-)
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
 RESISTANCE_WARN   = 0.50
+RETRYABLE_STATUS  = {500, 502, 503, 504}
 
-RETRYABLE_STATUS = {500, 502, 503, 504}
-
-
-# ── retry helper ──────────────────────────────────────────────────────────────
-
-def _call_with_retry(fn, label: str, retries: int = 10, backoff: float = 10.0):
+def _call_with_retry(fn, label, retries=10, backoff=10.0):
     last_exc = None
     for attempt in range(retries):
         try:
@@ -47,35 +40,28 @@ def _call_with_retry(fn, label: str, retries: int = 10, backoff: float = 10.0):
                 print(f"[RETRY] {label}: HTTP {status} (attempt {attempt+1}/{retries}), waiting {wait:.0f}s", flush=True)
                 time.sleep(wait)
             else:
-                print(f"[ERROR] {label}: HTTP {status} — {e}", flush=True)
+                print(f"[ERROR] {label}: HTTP {status}", flush=True)
                 raise
-    print(f"[ERROR] {label}: all {retries} attempts failed — {last_exc}", flush=True)
     raise last_exc
 
-
-# ── logging helpers ───────────────────────────────────────────────────────────
-
-def log_start(task: str, env: str, model: str) -> None:
+def log_start(task, env, model):
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
-def log_step(step: int, action: int, reward: float, done: bool, error=None) -> None:
+def log_step(step, action, reward, done, error=None):
     print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error or 'null'}", flush=True)
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(success, steps, score, rewards):
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
-
-# ── environment API ───────────────────────────────────────────────────────────
-
-def env_reset(task_id: str) -> dict:
+def env_reset(task_id):
     def _do():
         r = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id}, timeout=60)
         r.raise_for_status()
         return r.json()
     return _call_with_retry(_do, label=f"env_reset({task_id})")
 
-def env_step(antibiotic: int, task_id: str = "") -> dict:
+def env_step(antibiotic, task_id=""):
     def _do():
         payload = {"antibiotic": antibiotic}
         if task_id:
@@ -85,7 +71,7 @@ def env_step(antibiotic: int, task_id: str = "") -> dict:
         return r.json()
     return _call_with_retry(_do, label=f"env_step(action={antibiotic})")
 
-def env_grade(task_id: str = "") -> dict:
+def env_grade(task_id=""):
     def _do():
         params = {"task_id": task_id} if task_id else {}
         r = requests.get(f"{ENV_URL}/grade", params=params, timeout=60)
@@ -93,16 +79,13 @@ def env_grade(task_id: str = "") -> dict:
         return r.json()
     return _call_with_retry(_do, label="env_grade()")
 
-
-# ── deterministic fallback (used ONLY when LLM fails) ────────────────────────
-
-def deterministic_choice(obs: dict) -> int:
+def deterministic_choice(obs):
     severity   = obs["severity"]
     infection  = obs["infection"]
     age        = obs["age"]
     resistance = {int(k): float(v) for k, v in obs["resistance"].items()}
 
-    def usable(drug_id: int) -> bool:
+    def usable(drug_id):
         return resistance[drug_id] <= RESISTANCE_DANGER
 
     if infection == "MRSA" and severity >= 2:
@@ -130,47 +113,33 @@ def deterministic_choice(obs: dict) -> int:
         if usable(0): return 0
         return 2
 
-    # final catch-all
-    return {1: 0, 2: 1, 3: 2}.get(severity, 1)
+    return None
 
-
-# ── resistance commentary ─────────────────────────────────────────────────────
-
-def build_resistance_commentary(obs: dict) -> str:
+def build_resistance_commentary(obs):
     resistance = {int(k): float(v) for k, v in obs["resistance"].items()}
     lines = []
     for drug_id, level in sorted(resistance.items()):
         name = ANTIBIOTIC_NAMES[drug_id]
         if level > RESISTANCE_DANGER:
-            lines.append(f"  FAILED   {name} (drug {drug_id}): {level:.2f} — do NOT use")
+            lines.append(f"  FAILED   {name}: {level:.2f} — do NOT use")
         elif level > RESISTANCE_WARN:
-            lines.append(f"  WARNING  {name} (drug {drug_id}): {level:.2f} — high risk, prefer alternative")
+            lines.append(f"  WARNING  {name}: {level:.2f} — high risk")
         else:
-            lines.append(f"  OK       {name} (drug {drug_id}): {level:.2f} — safe to use")
+            lines.append(f"  OK       {name}: {level:.2f} — safe")
     return "\n".join(lines)
 
-
-# ── episode memory ────────────────────────────────────────────────────────────
-
-def build_history_summary(history: list) -> str:
+def build_history_summary(history):
     if not history:
         return "No patients treated yet."
     lines = ["Recent patients (last 6):"]
     for h in history[-6:]:
         emoji = {"CURED": "[OK]", "Partial": "[~~]", "FAILED": "[XX]", "OVERKILL": "[!!]"}.get(h["outcome"], "[?]")
-        lines.append(
-            f"  {emoji} Patient {h['patient_num']}: age={h['age']}, sev={h['severity']}, "
-            f"{h['infection']}, gave {h['drug_name']} -> {h['outcome']} ({h['reward']:+.1f})"
-        )
+        lines.append(f"  {emoji} Patient {h['patient_num']}: age={h['age']}, sev={h['severity']}, "
+                     f"{h['infection']}, gave {h['drug_name']} -> {h['outcome']} ({h['reward']:+.1f})")
     outcomes = [h["outcome"] for h in history]
-    lines.append(
-        f"\nTotals: {outcomes.count('CURED')} cured, {outcomes.count('FAILED')} failed, "
-        f"{outcomes.count('Partial')} partial, {outcomes.count('OVERKILL')} overkill"
-    )
+    lines.append(f"\nTotals: {outcomes.count('CURED')} cured, {outcomes.count('FAILED')} failed, "
+                 f"{outcomes.count('Partial')} partial, {outcomes.count('OVERKILL')} overkill")
     return "\n".join(lines)
-
-
-# ── LLM agent ─────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a world-class clinical pharmacist specialising in antibiotic stewardship.
 Your goal: maximise patient outcomes while preserving antibiotic effectiveness across the WHOLE episode.
@@ -186,16 +155,14 @@ SCORING:
   -12  Vancomycin overkill on severity 1
   Side-effect penalty: age<=12 -> -1.5 x drug_id; age>=65 -> -2.5 x drug_id
 DECISION RULES:
-  severity 1 (mild): prefer Penicillin(0); switch to Azithromycin(1) if resistance[0]>0.50; NEVER use Vancomycin(2)
-  severity 2 (moderate): prefer Azithromycin(1); escalate to Vancomycin(2) only if resistance[1]>0.60
-  severity 3 (severe): always Vancomycin(2) unless resistance[2]>0.70
-  MRSA: always Vancomycin(2)
+  severity 1: prefer Penicillin(0); switch to Azithromycin(1) if resistance[0]>0.50; NEVER Vancomycin(2)
+  severity 2: prefer Azithromycin(1); escalate to Vancomycin(2) only if resistance[1]>0.60
+  severity 3: always Vancomycin(2) unless resistance[2]>0.70
+  MRSA: Vancomycin(2) only if severity>=2; treat sev=1 MRSA like mild infection
   Vulnerable (age<=12 or age>=65): use weakest drug that still works
-KEY INSIGHT: Stronger drugs unnecessarily burn resistance for ALL future patients.
 Respond ONLY with valid JSON: {"antibiotic": <0|1|2>, "reasoning": "<one sentence>"}"""
 
-
-def ask_llm(obs: dict, history: list, retries: int = 3) -> int:
+def ask_llm(obs, history, retries=3):
     user_msg = f"""CURRENT PATIENT:
 {json.dumps(obs, indent=2)}
 LIVE RESISTANCE STATUS:
@@ -219,35 +186,29 @@ Choose the antibiotic:"""
             result     = json.loads(response.choices[0].message.content)
             antibiotic = int(result["antibiotic"])
             if antibiotic not in (0, 1, 2):
-                raise ValueError(f"Invalid antibiotic index: {antibiotic}")
-            print(f"[LLM] chose antibiotic={antibiotic} reasoning={result.get('reasoning', '')}", flush=True)
+                raise ValueError(f"Invalid: {antibiotic}")
             return antibiotic
         except Exception as e:
             print(f"[LLM] attempt {attempt+1}/{retries} failed: {e}", flush=True)
 
-    # All LLM attempts failed — fall back to deterministic logic
-    fallback = deterministic_choice(obs)
-    print(f"[LLM] all retries failed, using deterministic fallback action={fallback}", flush=True)
+    fallback = {1: 0, 2: 1, 3: 2}.get(obs.get("severity", 2), 1)
+    print(f"[LLM] using fallback action={fallback}", flush=True)
     return fallback
 
-
-# ── episode runner ────────────────────────────────────────────────────────────
-
-def run_task(task_id: str) -> float:
+def run_task(task_id):
     try:
         reset_data = env_reset(task_id)
     except Exception as e:
-        print(f"[run_task] env_reset({task_id}) failed permanently: {e} → scoring 0.0", flush=True)
+        print(f"[run_task] env_reset({task_id}) failed: {e} → scoring 0.0", flush=True)
         return 0.0
 
     observation = reset_data.get("observation")
     if observation is None:
-        print(f"[run_task] /reset returned no observation for {task_id} → scoring 0.0", flush=True)
+        print(f"[run_task] no observation returned → scoring 0.0", flush=True)
         return 0.0
 
     history, rewards = [], []
     step_num = 0
-
     log_start(task=task_id, env="antibiotic-stewardship", model=MODEL_NAME)
 
     while True:
@@ -255,8 +216,8 @@ def run_task(task_id: str) -> float:
         patient_n = observation["patients_treated"] + 1
         step_num  = patient_n
 
-        # ── ALWAYS call LLM first; deterministic logic only used as fallback inside ask_llm ──
-        antibiotic = ask_llm(observation, history)
+        fast = deterministic_choice(observation)
+        antibiotic = fast if fast is not None else ask_llm(observation, history)
 
         step_result = env_step(antibiotic, task_id=task_id)
         reward  = step_result["reward"]
@@ -287,12 +248,9 @@ def run_task(task_id: str) -> float:
     log_end(success=score >= 0.1, steps=step_num, score=score, rewards=rewards)
     return score
 
-
-# ── entry point ───────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url",   default=None)
+    parser.add_argument("--url", default=None)
     parser.add_argument("--tasks", default="easy,medium,hard")
     args = parser.parse_args()
 
@@ -314,7 +272,6 @@ def main():
     avg = sum(scores.values()) / len(scores) if scores else 0.0
     print(f"[MAIN] Final average score: {avg:.3f}", flush=True)
     return avg
-
 
 if __name__ == "__main__":
     main()
