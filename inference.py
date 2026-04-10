@@ -3,23 +3,23 @@ from openai import OpenAI
 from typing import Optional, List
 
 # LLM config — evaluator provides these
-API_BASE_URL = os.environ["API_BASE_URL"]   # no default
+API_BASE_URL = os.environ["API_BASE_URL"]
 MODEL_NAME   = os.environ["MODEL_NAME"]
-API_KEY      = os.environ["API_KEY"]        # USE THIS
+API_KEY      = os.environ["API_KEY"]
 HF_TOKEN     = os.environ.get("HF_TOKEN", "")
 
 ENV_URL = os.getenv("ENV_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
 
 client = OpenAI(
     base_url=API_BASE_URL,
-    api_key=API_KEY,      # << not HF_TOKEN
+    api_key=API_KEY,
 )
+
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
 RESISTANCE_WARN   = 0.50
 
-# 503 = backend session not ready (now returned instead of 400)
-RETRYABLE_STATUS = {500, 502, 503, 504}  # 500=unhandled server exception
+RETRYABLE_STATUS = {500, 502, 503, 504}
 
 
 # ── retry helper ──────────────────────────────────────────────────────────────
@@ -79,7 +79,7 @@ def env_step(antibiotic: int, task_id: str = "") -> dict:
     def _do():
         payload = {"antibiotic": antibiotic}
         if task_id:
-            payload["task_id"] = task_id          # lets backend route by task_id, not _active_task
+            payload["task_id"] = task_id
         r = requests.post(f"{ENV_URL}/step", json=payload, timeout=60)
         r.raise_for_status()
         return r.json()
@@ -94,9 +94,9 @@ def env_grade(task_id: str = "") -> dict:
     return _call_with_retry(_do, label="env_grade()")
 
 
-# ── deterministic fast-path ───────────────────────────────────────────────────
+# ── deterministic fallback (used ONLY when LLM fails) ────────────────────────
 
-def deterministic_choice(obs: dict) -> Optional[int]:
+def deterministic_choice(obs: dict) -> int:
     severity   = obs["severity"]
     infection  = obs["infection"]
     age        = obs["age"]
@@ -105,14 +105,12 @@ def deterministic_choice(obs: dict) -> Optional[int]:
     def usable(drug_id: int) -> bool:
         return resistance[drug_id] <= RESISTANCE_DANGER
 
-    # MRSA: Vancomycin only if severe enough — NEVER overkill on sev=1
     if infection == "MRSA" and severity >= 2:
         return 2
     if infection == "MRSA" and severity == 1:
-        # treat like a mild infection — use weakest usable drug
         if usable(0): return 0
         if usable(1): return 1
-        return 2  # last resort
+        return 2
 
     if severity == 3:
         if usable(2): return 2
@@ -121,19 +119,19 @@ def deterministic_choice(obs: dict) -> Optional[int]:
 
     is_vulnerable = age <= 12 or age >= 65
 
-    # severity 1: always prefer Penicillin, switch to Azithromycin if needed
     if severity == 1:
         if usable(0): return 0
         if usable(1): return 1
-        return 2  # only if both failed
+        return 2
 
-    # severity 2: prefer Azithromycin, escalate only if needed
     if severity == 2:
-        if is_vulnerable and usable(0): return 0   # minimize side-effects
+        if is_vulnerable and usable(0): return 0
         if usable(1): return 1
         if usable(0): return 0
         return 2
-    return None
+
+    # final catch-all
+    return {1: 0, 2: 1, 3: 2}.get(severity, 1)
 
 
 # ── resistance commentary ─────────────────────────────────────────────────────
@@ -221,20 +219,21 @@ Choose the antibiotic:"""
             result     = json.loads(response.choices[0].message.content)
             antibiotic = int(result["antibiotic"])
             if antibiotic not in (0, 1, 2):
-                raise ValueError(f"Invalid: {antibiotic}")
+                raise ValueError(f"Invalid antibiotic index: {antibiotic}")
+            print(f"[LLM] chose antibiotic={antibiotic} reasoning={result.get('reasoning', '')}", flush=True)
             return antibiotic
         except Exception as e:
             print(f"[LLM] attempt {attempt+1}/{retries} failed: {e}", flush=True)
 
-    fallback = {1: 0, 2: 1, 3: 2}.get(obs.get("severity", 2), 1)
-    print(f"[LLM] using fallback action={fallback}", flush=True)
+    # All LLM attempts failed — fall back to deterministic logic
+    fallback = deterministic_choice(obs)
+    print(f"[LLM] all retries failed, using deterministic fallback action={fallback}", flush=True)
     return fallback
 
 
 # ── episode runner ────────────────────────────────────────────────────────────
 
 def run_task(task_id: str) -> float:
-    # ── inner reset guard: if /reset fails after all retries, return 0.0 cleanly
     try:
         reset_data = env_reset(task_id)
     except Exception as e:
@@ -256,8 +255,8 @@ def run_task(task_id: str) -> float:
         patient_n = observation["patients_treated"] + 1
         step_num  = patient_n
 
-        fast = deterministic_choice(observation)
-        antibiotic = fast if fast is not None else ask_llm(observation, history)
+        # ── ALWAYS call LLM first; deterministic logic only used as fallback inside ask_llm ──
+        antibiotic = ask_llm(observation, history)
 
         step_result = env_step(antibiotic, task_id=task_id)
         reward  = step_result["reward"]
@@ -283,8 +282,8 @@ def run_task(task_id: str) -> float:
             print(f"[WARN] No observation at step {step_num}, ending early.", flush=True)
             break
 
-    grade   = env_grade(task_id=task_id)
-    score   = grade.get("score", 0.0)
+    grade = env_grade(task_id=task_id)
+    score = grade.get("score", 0.0)
     log_end(success=score >= 0.1, steps=step_num, score=score, rewards=rewards)
     return score
 
