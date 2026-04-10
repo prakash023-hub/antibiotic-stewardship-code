@@ -2,12 +2,13 @@ import os, json, argparse, requests, time
 from openai import OpenAI
 from typing import Optional, List
 
+# ── config ────────────────────────────────────────────────────────────────────
 # LLM config — evaluator provides these
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN     = os.getenv("HF_TOKEN", "")
+HF_TOKEN     = os.getenv("HF_TOKEN", "") or os.getenv("OPENAI_API_KEY", "")
 
-# Environment URL — YOUR HuggingFace Space
+# Environment URL — YOUR HuggingFace Space (separate from LLM endpoint!)
 ENV_URL = os.getenv("ENV_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
 
 client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
@@ -15,9 +16,14 @@ client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
 RESISTANCE_WARN   = 0.50
-RETRYABLE_STATUS  = {500, 502, 503, 504}
 
-def _call_with_retry(fn, label, retries=10, backoff=10.0):
+# 503 = backend session not ready (now returned instead of 400)
+RETRYABLE_STATUS = {500, 502, 503, 504}  # 500=unhandled server exception
+
+
+# ── retry helper ──────────────────────────────────────────────────────────────
+
+def _call_with_retry(fn, label: str, retries: int = 10, backoff: float = 10.0):
     last_exc = None
     for attempt in range(retries):
         try:
@@ -40,38 +46,45 @@ def _call_with_retry(fn, label, retries=10, backoff=10.0):
                 print(f"[RETRY] {label}: HTTP {status} (attempt {attempt+1}/{retries}), waiting {wait:.0f}s", flush=True)
                 time.sleep(wait)
             else:
-                print(f"[ERROR] {label}: HTTP {status}", flush=True)
+                print(f"[ERROR] {label}: HTTP {status} — {e}", flush=True)
                 raise
+    print(f"[ERROR] {label}: all {retries} attempts failed — {last_exc}", flush=True)
     raise last_exc
 
-def log_start(task, env, model):
+
+# ── logging helpers ───────────────────────────────────────────────────────────
+
+def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
-def log_step(step, action, reward, done, error=None):
+def log_step(step: int, action: int, reward: float, done: bool, error=None) -> None:
     print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error or 'null'}", flush=True)
 
-def log_end(success, steps, score, rewards):
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
-def env_reset(task_id):
+
+# ── environment API ───────────────────────────────────────────────────────────
+
+def env_reset(task_id: str) -> dict:
     def _do():
         r = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id}, timeout=60)
         r.raise_for_status()
         return r.json()
     return _call_with_retry(_do, label=f"env_reset({task_id})")
 
-def env_step(antibiotic, task_id=""):
+def env_step(antibiotic: int, task_id: str = "") -> dict:
     def _do():
         payload = {"antibiotic": antibiotic}
         if task_id:
-            payload["task_id"] = task_id
+            payload["task_id"] = task_id          # lets backend route by task_id, not _active_task
         r = requests.post(f"{ENV_URL}/step", json=payload, timeout=60)
         r.raise_for_status()
         return r.json()
     return _call_with_retry(_do, label=f"env_step(action={antibiotic})")
 
-def env_grade(task_id=""):
+def env_grade(task_id: str = "") -> dict:
     def _do():
         params = {"task_id": task_id} if task_id else {}
         r = requests.get(f"{ENV_URL}/grade", params=params, timeout=60)
@@ -79,21 +92,26 @@ def env_grade(task_id=""):
         return r.json()
     return _call_with_retry(_do, label="env_grade()")
 
-def deterministic_choice(obs):
+
+# ── deterministic fast-path ───────────────────────────────────────────────────
+
+def deterministic_choice(obs: dict) -> Optional[int]:
     severity   = obs["severity"]
     infection  = obs["infection"]
     age        = obs["age"]
     resistance = {int(k): float(v) for k, v in obs["resistance"].items()}
 
-    def usable(drug_id):
+    def usable(drug_id: int) -> bool:
         return resistance[drug_id] <= RESISTANCE_DANGER
 
+    # MRSA: Vancomycin only if severe enough — NEVER overkill on sev=1
     if infection == "MRSA" and severity >= 2:
         return 2
     if infection == "MRSA" and severity == 1:
+        # treat like a mild infection — use weakest usable drug
         if usable(0): return 0
         if usable(1): return 1
-        return 2
+        return 2  # last resort
 
     if severity == 3:
         if usable(2): return 2
@@ -102,44 +120,58 @@ def deterministic_choice(obs):
 
     is_vulnerable = age <= 12 or age >= 65
 
+    # severity 1: always prefer Penicillin, switch to Azithromycin if needed
     if severity == 1:
         if usable(0): return 0
         if usable(1): return 1
-        return 2
+        return 2  # only if both failed
 
+    # severity 2: prefer Azithromycin, escalate only if needed
     if severity == 2:
-        if is_vulnerable and usable(0): return 0
+        if is_vulnerable and usable(0): return 0   # minimize side-effects
         if usable(1): return 1
         if usable(0): return 0
         return 2
-
     return None
 
-def build_resistance_commentary(obs):
+
+# ── resistance commentary ─────────────────────────────────────────────────────
+
+def build_resistance_commentary(obs: dict) -> str:
     resistance = {int(k): float(v) for k, v in obs["resistance"].items()}
     lines = []
     for drug_id, level in sorted(resistance.items()):
         name = ANTIBIOTIC_NAMES[drug_id]
         if level > RESISTANCE_DANGER:
-            lines.append(f"  FAILED   {name}: {level:.2f} — do NOT use")
+            lines.append(f"  FAILED   {name} (drug {drug_id}): {level:.2f} — do NOT use")
         elif level > RESISTANCE_WARN:
-            lines.append(f"  WARNING  {name}: {level:.2f} — high risk")
+            lines.append(f"  WARNING  {name} (drug {drug_id}): {level:.2f} — high risk, prefer alternative")
         else:
-            lines.append(f"  OK       {name}: {level:.2f} — safe")
+            lines.append(f"  OK       {name} (drug {drug_id}): {level:.2f} — safe to use")
     return "\n".join(lines)
 
-def build_history_summary(history):
+
+# ── episode memory ────────────────────────────────────────────────────────────
+
+def build_history_summary(history: list) -> str:
     if not history:
         return "No patients treated yet."
     lines = ["Recent patients (last 6):"]
     for h in history[-6:]:
         emoji = {"CURED": "[OK]", "Partial": "[~~]", "FAILED": "[XX]", "OVERKILL": "[!!]"}.get(h["outcome"], "[?]")
-        lines.append(f"  {emoji} Patient {h['patient_num']}: age={h['age']}, sev={h['severity']}, "
-                     f"{h['infection']}, gave {h['drug_name']} -> {h['outcome']} ({h['reward']:+.1f})")
+        lines.append(
+            f"  {emoji} Patient {h['patient_num']}: age={h['age']}, sev={h['severity']}, "
+            f"{h['infection']}, gave {h['drug_name']} -> {h['outcome']} ({h['reward']:+.1f})"
+        )
     outcomes = [h["outcome"] for h in history]
-    lines.append(f"\nTotals: {outcomes.count('CURED')} cured, {outcomes.count('FAILED')} failed, "
-                 f"{outcomes.count('Partial')} partial, {outcomes.count('OVERKILL')} overkill")
+    lines.append(
+        f"\nTotals: {outcomes.count('CURED')} cured, {outcomes.count('FAILED')} failed, "
+        f"{outcomes.count('Partial')} partial, {outcomes.count('OVERKILL')} overkill"
+    )
     return "\n".join(lines)
+
+
+# ── LLM agent ─────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a world-class clinical pharmacist specialising in antibiotic stewardship.
 Your goal: maximise patient outcomes while preserving antibiotic effectiveness across the WHOLE episode.
@@ -155,14 +187,16 @@ SCORING:
   -12  Vancomycin overkill on severity 1
   Side-effect penalty: age<=12 -> -1.5 x drug_id; age>=65 -> -2.5 x drug_id
 DECISION RULES:
-  severity 1: prefer Penicillin(0); switch to Azithromycin(1) if resistance[0]>0.50; NEVER Vancomycin(2)
-  severity 2: prefer Azithromycin(1); escalate to Vancomycin(2) only if resistance[1]>0.60
-  severity 3: always Vancomycin(2) unless resistance[2]>0.70
-  MRSA: Vancomycin(2) only if severity>=2; treat sev=1 MRSA like mild infection
+  severity 1 (mild): prefer Penicillin(0); switch to Azithromycin(1) if resistance[0]>0.50; NEVER use Vancomycin(2)
+  severity 2 (moderate): prefer Azithromycin(1); escalate to Vancomycin(2) only if resistance[1]>0.60
+  severity 3 (severe): always Vancomycin(2) unless resistance[2]>0.70
+  MRSA: always Vancomycin(2)
   Vulnerable (age<=12 or age>=65): use weakest drug that still works
+KEY INSIGHT: Stronger drugs unnecessarily burn resistance for ALL future patients.
 Respond ONLY with valid JSON: {"antibiotic": <0|1|2>, "reasoning": "<one sentence>"}"""
 
-def ask_llm(obs, history, retries=3):
+
+def ask_llm(obs: dict, history: list, retries: int = 3) -> int:
     user_msg = f"""CURRENT PATIENT:
 {json.dumps(obs, indent=2)}
 LIVE RESISTANCE STATUS:
@@ -195,20 +229,25 @@ Choose the antibiotic:"""
     print(f"[LLM] using fallback action={fallback}", flush=True)
     return fallback
 
-def run_task(task_id):
+
+# ── episode runner ────────────────────────────────────────────────────────────
+
+def run_task(task_id: str) -> float:
+    # ── inner reset guard: if /reset fails after all retries, return 0.0 cleanly
     try:
         reset_data = env_reset(task_id)
     except Exception as e:
-        print(f"[run_task] env_reset({task_id}) failed: {e} → scoring 0.0", flush=True)
+        print(f"[run_task] env_reset({task_id}) failed permanently: {e} → scoring 0.0", flush=True)
         return 0.0
 
     observation = reset_data.get("observation")
     if observation is None:
-        print(f"[run_task] no observation returned → scoring 0.0", flush=True)
+        print(f"[run_task] /reset returned no observation for {task_id} → scoring 0.0", flush=True)
         return 0.0
 
     history, rewards = [], []
     step_num = 0
+
     log_start(task=task_id, env="antibiotic-stewardship", model=MODEL_NAME)
 
     while True:
@@ -243,20 +282,39 @@ def run_task(task_id):
             print(f"[WARN] No observation at step {step_num}, ending early.", flush=True)
             break
 
-    grade = env_grade(task_id=task_id)
-    score = grade.get("score", 0.0)
+    grade   = env_grade(task_id=task_id)
+    score   = grade.get("score", 0.0)
     log_end(success=score >= 0.1, steps=step_num, score=score, rewards=rewards)
     return score
 
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def wake_up_space():
+    """Ping HF Space to wake it up before evaluation starts."""
+    for i in range(5):
+        try:
+            r = requests.get(f"{ENV_URL}/health", timeout=30)
+            if r.status_code == 200:
+                print(f"[INIT] Space is alive!", flush=True)
+                return True
+        except Exception:
+            print(f"[INIT] Waiting for Space to wake up... ({i+1}/5)", flush=True)
+            time.sleep(15)
+    print("[INIT] Space did not respond — proceeding anyway.", flush=True)
+    return False
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default=None)
+    parser.add_argument("--url",   default=None)
     parser.add_argument("--tasks", default="easy,medium,hard")
     args = parser.parse_args()
 
     if args.url:
         global ENV_URL
         ENV_URL = args.url.rstrip("/")
+
+    wake_up_space()
 
     task_list = [t.strip() for t in args.tasks.split(",")]
     scores = {}
@@ -273,5 +331,10 @@ def main():
     print(f"[MAIN] Final average score: {avg:.3f}", flush=True)
     return avg
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[FATAL] Unhandled exception: {e}", flush=True)
+        import sys; sys.exit(0)
