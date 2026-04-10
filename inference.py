@@ -1,17 +1,15 @@
-import os, json, argparse, requests, time
-from openai import OpenAI
-from typing import Optional, List
-
-# ── config ────────────────────────────────────────────────────────────────────
 # LLM config — evaluator provides these
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN     = os.getenv("HF_TOKEN", "")
+API_BASE_URL = os.environ["API_BASE_URL"]   # no default
+MODEL_NAME   = os.environ["MODEL_NAME"]
+API_KEY      = os.environ["API_KEY"]        # USE THIS
+HF_TOKEN     = os.environ.get("HF_TOKEN", "")
 
-# Environment URL — YOUR HuggingFace Space (separate from LLM endpoint!)
 ENV_URL = os.getenv("ENV_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
 
-client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+client = OpenAI(
+    base_url=API_BASE_URL,
+    api_key=API_KEY,      # << not HF_TOKEN
+)
 
 ANTIBIOTIC_NAMES  = {0: "Penicillin", 1: "Azithromycin", 2: "Vancomycin"}
 RESISTANCE_DANGER = 0.70
