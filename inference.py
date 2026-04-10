@@ -6,7 +6,7 @@ from typing import Optional, List
 # LLM config — evaluator provides these
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN     = os.getenv("HF_TOKEN", "") or os.getenv("OPENAI_API_KEY", "")
+HF_TOKEN = os.getenv("API_KEY", "") or os.getenv("HF_TOKEN", "") or os.getenv("OPENAI_API_KEY", "")
 
 # Environment URL — YOUR HuggingFace Space (separate from LLM endpoint!)
 ENV_URL = os.getenv("ENV_URL", "https://prakashrajk-antibiotic-stewardship.hf.space")
